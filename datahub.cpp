@@ -18,18 +18,6 @@
 
 namespace datahub {
     namespace network {
-        template <typename M> struct Method final {};
-        template <typename R, typename C, typename... Args> struct Method<R(C::*)(Args...)> final {
-            template <R(C::*m)(Args...)> static auto asFunc() {
-                struct fn {
-                    static R function(void *target, Args... args) {
-                        return (reinterpret_cast<C *>(target)->*m)(std::forward<Args>(args)...);
-                    }
-                };
-                return fn::function;
-            }
-        };
-        
         namespace platform {
             using Socket = int;
             static const Socket INVALID_SOCKET = -1;
@@ -301,7 +289,7 @@ namespace datahub {
             }
 
             template <typename T,
-                ConnectionState *(T::*onClientConnected)(),
+                ConnectionState *(T::*onClientConnected)(const std::uint8_t *),
                 void (T::*onClientDisconnected)(ConnectionState *),
                 void (T::*onDataReceived)(ConnectionState *, const std::uint8_t *, std::uint16_t),
                 void (T::*onError)(const char *msg)
@@ -314,7 +302,7 @@ namespace datahub {
                 _onError = Method<decltype(onError)>::template asFunc<onError>();
             }
             
-            bool listen(const char *addr, std::uint16_t portTCP) {
+            bool listen(const char *addr, std::uint16_t portTCP, std::uint16_t portUDP) {
                 if (_target == nullptr) {
                     return false;
                 }
@@ -327,7 +315,12 @@ namespace datahub {
                                 
                                 if (_networkAPI.accept(_listeningSocket, client)) {
                                     if (_networkAPI.configureSocket(client)) {
-                                        if (ConnectionState *userState = _onClientConnected(_target)) {
+                                        thread_local static std::uint8_t buffer[RECV_BUFFER_SIZE];
+
+                                        // ToDo:
+                                        // initial handshake -> client time, key
+                                        
+                                        if (ConnectionState *userState = _onClientConnected(_target, buffer)) {
                                             platform::BufferAllocator::Buffer *stub = _bufferAllocator.alloc(nullptr, 0);
                                             userState->socket = client;
                                             userState->sendQueueHead = stub;
@@ -394,8 +387,8 @@ namespace datahub {
         private:
             // must return allocated and initialized ConnectionState object or it's derivent.
             // 'nextBytesToReceive' field is amount of bytes to receive before '_onDataReceived' notification
-            ConnectionState *(*_onClientConnected)(void *) = nullptr;
-            void (*_onClientDisconnected)(void *, ConnectionState *userState) = nullptr;
+            ConnectionState *(*_onClientConnected)(void *, const std::uint8_t *) = nullptr;
+            void (*_onClientDisconnected)(void *, ConnectionState *) = nullptr;
             platform::Socket _listeningSocket = platform::INVALID_SOCKET;
             
         private:
@@ -428,7 +421,7 @@ namespace datahub {
                 _onError = Method<decltype(onError)>::template asFunc<onError>();
             }
             
-            bool connect(const char *addr, std::uint16_t portTCP, std::uint16_t nextBytesToReceive) {
+            bool connect(const char *addr, std::uint16_t portTCP, std::uint16_t portUDP, const std::uint8_t *key, std::uint16_t nextBytesToReceive) {
                 if (_target == nullptr) {
                     return false;
                 }
@@ -436,6 +429,8 @@ namespace datahub {
                 if (_networkAPI.createSocket(_state.socket)) {
                     if (_networkAPI.configureSocket(_state.socket)) {
                         if (_networkAPI.connect(_state.socket, addr, portTCP)) {
+                            // TODO: handshake
+                        
                             _state.nextBytesToReceive = nextBytesToReceive;
                             _networkEventSource.registerSocket(_state.socket, &_state);
                             _threadFactory.createThread([this]() {
@@ -496,6 +491,7 @@ namespace datahub {
 
 namespace datahub {
     namespace {
+        // TODO: validate for serialized size < std::uint16_t::max()
         bool validateLayout(const std::uint8_t *layoutData, std::size_t layoutLength) {
             const std::uint8_t *layoutOffset = layoutData;
             
@@ -535,10 +531,10 @@ namespace datahub {
     };
     
     struct DataHub::Data {
-        std::atomic<std::uint32_t> nextUID {0x100};
+        std::atomic<ElementId> nextElementUID {0x100};
         DataHubType type;
         
-        Base *findElement(std::uint32_t id) {
+        Base *findElement(ElementId id) {
             auto index = _elements.find(id);
             if (index != _elements.end()) {
                 return index->second;
@@ -550,14 +546,78 @@ namespace datahub {
             return nullptr;
         }
         
-        bool addElement(std::uint32_t id, Base *element) {
+        bool addElement(ElementId id, Base *element) {
             return _elements.emplace(id, element).second;
         }
 
     private:
-        std::unordered_map<std::uint32_t, Base *> _elements;
+        std::unordered_map<ElementId, Base *> _elements;
     };
+    
+    struct ServerData : public DataHub::Network {
+        struct ConnectionState : public network::ConnectionState {
+            ClientId id;
+        };
+        
+        network::Server server;
+        
+        std::function<bool(ClientId, const std::uint8_t *)> connected;
+        std::function<void(ClientId)> disconnected;
 
+        ConnectionState *findConnection(ClientId id) {
+            auto index = _connections.find(id);
+            if (index != _connections.end()) {
+                return &index->second;
+            }
+            else {
+                DataHub::onError("At 'ServerData::findConnection(...)' : connection not found");
+            }
+            
+            return nullptr;
+        }
+
+        network::ConnectionState *onConnected(const std::uint8_t *key) {
+            ClientId id = _nextClientUID++;
+            ConnectionState *connection = &_connections[id];
+            connection->nextBytesToReceive = 1;
+            connection->id = id;
+            return connection;
+        }
+        
+        void onDisconnected(network::ConnectionState *state) {
+            ConnectionState *connection = static_cast<ConnectionState *>(state);
+            _connections.erase(connection->id);
+        }
+        
+        void onDataReceived(network::ConnectionState *state, const std::uint8_t *input, std::uint16_t length) {
+            
+        }
+
+        void onError(const char *error) {
+            DataHub::onError("[DataHub Server] %s", error);
+        }
+        
+    private:
+        std::atomic<ClientId> _nextClientUID {0x100};
+        std::unordered_map<ClientId, ConnectionState> _connections;
+    };
+    
+    struct ClientData : DataHub::Network {
+        network::Client client;
+        
+        void onDisconnected() {
+        
+        }
+        
+        void onDataReceived(network::ConnectionState *state, const std::uint8_t *input, std::uint16_t length) {
+
+        }
+        
+        void onError(const char *error) {
+            DataHub::onError("[DataHub Client] %s", error);
+        }
+    };
+    
     Scope::Scope() : datahub(nullptr) {
         _data = std::make_unique<Scope::Data>();
         _data->accessType = AccessType::READONLY;
@@ -585,15 +645,18 @@ namespace datahub {
             auto bufferRef = std::cref(serializedData);
             element->onItemChanged(element, id, &bufferRef);
         }
+        else {
+            DataHub::onError("At 'Scope::_onValueChanged(...)' : element not found");
+        }
     }
     
     void Scope::_onItemAdded(std::uint32_t arrayId, std::uint32_t itemId, const std::uint8_t (&serializedData)[BUFFER_SIZE], std::uint16_t length) {
         if (auto element = datahub->_data->findElement(arrayId)) {
             auto bufferRef = std::cref(serializedData);
             element->onItemChanged(element, itemId, &bufferRef);
-
-            // here we must decide either to send over network or not
-
+        }
+        else {
+            DataHub::onError("At 'Scope::_onItemAdded(...)' : element not found");
         }
     }
     
@@ -601,41 +664,50 @@ namespace datahub {
         if (auto element = datahub->_data->findElement(arrayId)) {
             element->onItemChanged(element, itemId, nullptr);
         }
+        else {
+            DataHub::onError("At 'Scope::_onItemRemoved(...)' : element not found");
+        }
     }
     
-    struct ServerData : DataHub::Data {
-        network::Server network;
-
-        network::ConnectionState *onConnected() {
-            
-            return nullptr;
-        }
-        
-        void onDisconnected(network::ConnectionState *state) {
-
-        }
-        
-        void onDataReceived(network::ConnectionState *state, const std::uint8_t *input, std::uint16_t length) {
-            
-        }
-
-        void onError(const char *error) {
-            
-        }
-    };
-    
-    struct ClientData : DataHub::Data {
-        network::Client network;
-        
-
-    };
-
     DataHub::DataHub() : _root(this) {
         
     }
     
     DataHub::~DataHub() {
+        
+    }
     
+    void DataHub::startServer(const char *ip, std::uint16_t portTCP, std::uint16_t portUDP, std::function<bool(ClientId, const std::uint8_t *)> &&cn, std::function<void(ClientId)> &&dn) {
+        if (_data->type == DataHubType::LOCAL) {
+            _data->type = DataHubType::SERVER;
+            _network = std::make_unique<ServerData>();
+
+            ServerData *serverData = static_cast<ServerData *>(_network.get());
+            serverData->server.initializeObserver<ServerData, &ServerData::onConnected, &ServerData::onDisconnected, &ServerData::onDataReceived, &ServerData::onError>(serverData);
+            
+            if (serverData->server.listen(ip, portTCP, portUDP) == false) {
+                DataHub::onError("At 'DataHub::startServer(...)' : server can't start listening");
+            }
+        }
+        else {
+            DataHub::onError("At 'DataHub::startServer(...)' : datahub of type = LOCAL is required to start server");
+        }
+    }
+    
+    void DataHub::disconnect(std::uint32_t clientId) {
+        if (_data->type == DataHubType::SERVER) {
+            ServerData *serverData = static_cast<ServerData *>(_network.get());
+            
+            if (ServerData::ConnectionState *state = serverData->findConnection(clientId)) {
+                serverData->server.disconnect(state);
+            }
+            else {
+                DataHub::onError("At 'DataHub::disconnect(...)' : connection not found");
+            }
+        }
+        else {
+            DataHub::onError("At 'DataHub::disconnect(...)' : datahub is not server");
+        }
     }
 
     std::uint8_t (&DataHub::_getWorkingBuffer())[BUFFER_SIZE] {
@@ -645,7 +717,7 @@ namespace datahub {
 
     bool DataHub::_getNextID(std::uint32_t &outID) {
         if (_data->type != DataHubType::CLIENT) {
-            outID = _data->nextUID++;
+            outID = _data->nextElementUID++;
             return true;
         }
         else {
@@ -655,40 +727,51 @@ namespace datahub {
         return false;
     }
 
-    bool DataHub::_initializeDataHub(DataHub *datahub, DataHubType type, std::size_t layoutSize, const char *host, std::uint16_t portTCP) {
-        std::uint8_t *dataOffset = reinterpret_cast<std::uint8_t *>(datahub) + sizeof(DataHub);
-        std::size_t dataLength = layoutSize;
+    bool DataHub::_initializeLocal(DataHub *dh, std::size_t lsize) {
+        std::uint8_t *dataOffset = reinterpret_cast<std::uint8_t *>(dh) + sizeof(DataHub);
+        std::size_t dataLength = lsize;
 
         if (validateLayout(dataOffset, dataLength)) {
-            if (type == DataHubType::LOCAL) {
-                datahub->_data = std::make_unique<DataHub::Data>();
-                datahub->_data->type = type;
+            dh->_data = std::make_unique<DataHub::Data>();
+            dh->_data->type = DataHubType::LOCAL;
 
-                if (DataHub::_initializeLayout(&datahub->_root, AccessType::READWRITE, dataOffset, dataLength)) {
-                    return true;
-                }
+            if (DataHub::_initializeLayout(&dh->_root, AccessType::READWRITE, dataOffset, dataLength)) {
+                return true;
             }
-            else if (type == DataHubType::SERVER) {
-                datahub->_data = std::make_unique<ServerData>();
-                datahub->_data->type = type;
+            else {
+                DataHub::onError("At 'DataHub::_initializeDataHub(...)' : layout initialization failed");
+            }
+        }
+        else {
+            DataHub::onError("At 'DataHub::_initializeDataHub(...)' : layout validation failed");
+        }
 
-                if (DataHub::_initializeLayout(&datahub->_root, AccessType::READWRITE, dataOffset, dataLength)) {
-                    ServerData *data = static_cast<ServerData *>(datahub->_data.get());
-                    data->network.initializeObserver<ServerData, &ServerData::onConnected, &ServerData::onDisconnected, &ServerData::onDataReceived, &ServerData::onError>(data);
-                    
-                    if (data->network.listen(host, portTCP)) {
-                        return true;
-                    }
-                    else {
-                        DataHub::onError("At 'DataHub::_initializeDataHub(...)' : server can't start listening");
-                    }
+        return false;
+    }
+
+    bool DataHub::_initializeClient(DataHub *dh, std::size_t lsize, const char *ip, std::uint16_t portTCP, std::uint16_t portUDP, const std::uint8_t *key, std::function<void()> &&dn) {
+        std::uint8_t *dataOffset = reinterpret_cast<std::uint8_t *>(dh) + sizeof(DataHub);
+        std::size_t dataLength = lsize;
+
+        if (validateLayout(dataOffset, dataLength)) {
+            dh->_data = std::make_unique<DataHub::Data>();
+            dh->_data->type = DataHubType::CLIENT;
+
+            if (DataHub::_initializeLayout(&dh->_root, AccessType::READONLY, dataOffset, dataLength)) {
+                dh->_network = std::make_unique<ClientData>();
+
+                ClientData *clientData = static_cast<ClientData *>(dh->_network.get());
+                clientData->client.initializeObserver<ClientData, &ClientData::onDisconnected, &ClientData::onDataReceived, &ClientData::onError>(clientData);
+                
+                if (clientData->client.connect(ip, portTCP, portUDP, key, 1) == false) {
+                    DataHub::onError("At 'DataHub::startServer(...)' : server can't start listening");
                 }
+                
+                return true;
             }
-            else if (type == DataHubType::CLIENT) {
-            
+            else {
+                DataHub::onError("At 'DataHub::_initializeDataHub(...)' : layout initialization failed");
             }
-            
-            DataHub::onError("At 'DataHub::_initializeDataHub(...)' : layout initialization failed");
         }
         else {
             DataHub::onError("At 'DataHub::_initializeDataHub(...)' : layout validation failed");
@@ -743,9 +826,6 @@ namespace datahub {
         
         return outputOffset - output;
     }
-    
-
-    
 }
 
 

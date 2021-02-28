@@ -19,11 +19,14 @@ namespace datahub {
     class Scope;
     class DataHub;
     
+    typedef std::uint32_t ElementId;
+    typedef std::uint32_t ClientId;
+
     typedef const std::reference_wrapper<const std::uint8_t[BUFFER_SIZE]> BufferRef;
     typedef bool (*ValidateArrayFunc)();
-    typedef void (*ItemChangedFunc)(Base *target, std::uint32_t id, BufferRef *);
+    typedef void (*ItemChangedFunc)(Base *target, ElementId id, BufferRef *);
     typedef struct {} *Token;
-
+    
     enum class AccessType : std::size_t
     {
         READONLY,
@@ -48,6 +51,18 @@ namespace datahub {
         LOCAL,
         SERVER,
         CLIENT,
+    };
+    
+    template <typename M> struct Method final {};
+    template <typename R, typename C, typename... Args> struct Method<R(C::*)(Args...)> final {
+        template <R(C::*m)(Args...)> static auto asFunc() {
+            struct fn {
+                static R function(void *target, Args... args) {
+                    return (reinterpret_cast<C *>(target)->*m)(std::forward<Args>(args)...);
+                }
+            };
+            return fn::function;
+        }
     };
 
     template<typename T> class Event final {
@@ -89,7 +104,7 @@ namespace datahub {
         const ElementType type;
 
         SyncType syncType = SyncType::STRICT;
-        std::uint32_t uid = 0;
+        ElementId uid = 0;
         
         const std::uint16_t dataLength;
         const std::uint16_t totalLength;
@@ -127,10 +142,10 @@ namespace datahub {
     private:
         Scope(DataHub *dh);
 
-        void _onValueChanged(std::uint32_t id, const std::uint8_t (&serializedData)[BUFFER_SIZE], std::uint16_t length);
-        void _onItemAdded(std::uint32_t arrayId, std::uint32_t itemId, const std::uint8_t (&serializedData)[BUFFER_SIZE], std::uint16_t length);
-        void _onItemRemoved(std::uint32_t arrayId, std::uint32_t itemId);
-        void _onRemoteCall(std::uint32_t id, const std::uint8_t (&serializedData)[BUFFER_SIZE], std::uint16_t length) {}
+        void _onValueChanged(ElementId id, const std::uint8_t (&serializedData)[BUFFER_SIZE], std::uint16_t length);
+        void _onItemAdded(ElementId arrayId, ElementId itemId, const std::uint8_t (&serializedData)[BUFFER_SIZE], std::uint16_t length);
+        void _onItemRemoved(ElementId arrayId, ElementId itemId);
+        void _onRemoteCall(ElementId id, const std::uint8_t (&serializedData)[BUFFER_SIZE], std::uint16_t length) {}
     
     public:
         struct Data;
@@ -154,30 +169,36 @@ namespace datahub {
         template<typename> friend struct Array;
         
         template<typename> friend auto make();
-        template<typename> friend auto makeAndListen(const char *, std::uint16_t);
-        template<typename> friend auto makeAndConnect(const char *, std::uint16_t);
+        template<typename> friend auto makeAndConnect(const char *, std::uint16_t, std::uint16_t, const std::uint8_t *, std::function<void()> &&);
 
     public:
         // user must provide implementation
         static void onError(const char *msg, ...);
+        
+        void startServer(const char *ip, std::uint16_t portTCP, std::uint16_t portUDP, std::function<bool(ClientId, const std::uint8_t *)> &&cn, std::function<void(ClientId)> &&dn);
+        void disconnect(ClientId clientId);
         
     protected:
         DataHub();
         ~DataHub();
         
     private:
-        static bool _initializeDataHub(DataHub *datahub, DataHubType type, std::size_t layoutSize, const char *host = nullptr, std::uint16_t portTCP = 0);
+        static bool _initializeLocal(DataHub *dh, std::size_t lsize);
+        static bool _initializeClient(DataHub *dh, std::size_t lsize, const char *ip, std::uint16_t portTCP, std::uint16_t portUDP, const std::uint8_t *key, std::function<void()> &&dn);
         static bool _initializeLayout(Scope *scope, AccessType accessType, std::uint8_t *layoutData, std::size_t layoutLength, BufferRef *serializedData = nullptr);
         static std::uint16_t _serializeLayout(const std::uint8_t *layout, std::size_t length, std::uint8_t (&output)[BUFFER_SIZE]);
         static std::uint8_t (&_getWorkingBuffer())[BUFFER_SIZE];
         
-        bool _getNextID(std::uint32_t &outID);
+        bool _getNextID(ElementId &outID);
         
     public:
         struct Data;
+        struct Network {};
 
     private:
         std::unique_ptr<Data> _data;
+        std::unique_ptr<Network> _network;
+
         Scope _root;
     };
     
@@ -191,7 +212,7 @@ namespace datahub {
         static_assert(std::is_copy_assignable<T>::value, "");
         static_assert(sizeof(T) < std::numeric_limits<std::uint16_t>::max(), "");
         
-        static void _onItemChanged(Base *target, std::uint32_t id, BufferRef *data) {
+        static void _onItemChanged(Base *target, ElementId id, BufferRef *data) {
             Value<T> *self = reinterpret_cast<Value<T> *>(target);
             const std::uint8_t (&source)[BUFFER_SIZE] = data->get();
             T newValue = *reinterpret_cast<const T *>(source);
@@ -253,7 +274,7 @@ namespace datahub {
         static_assert(std::is_default_constructible<T>::value, "");
         static_assert(std::is_polymorphic<T>::value == false, "");
         static_assert(sizeof(T) < std::numeric_limits<std::uint16_t>::max(), "");
-        
+
         static bool _validate() {
             T data;
             const std::uint8_t *layoutData = reinterpret_cast<const std::uint8_t *>(&data);
@@ -284,7 +305,7 @@ namespace datahub {
             return true;
         }
         
-        static void _onItemChanged(Base *target, std::uint32_t id, BufferRef *serializedData) {
+        static void _onItemChanged(Base *target, ElementId id, BufferRef *serializedData) {
             Array<T> *self = reinterpret_cast<Array<T> *>(target);
             Scope *scope = self->_base.scope;
             
@@ -301,7 +322,7 @@ namespace datahub {
                 
                 {
                     std::lock_guard<std::mutex> guard(scope->getMutex());
-                    addedItem = &(self->_data[id]);
+                    addedItem = &self->_data[id];
                     addedItem->datahub = scope->datahub;
                     DataHub::_initializeLayout(addedItem, scope->getAccessType(), reinterpret_cast<std::uint8_t *>(addedItem) + sizeof(Scope), sizeof(T) - sizeof(Scope), serializedData);
                 }
@@ -315,8 +336,8 @@ namespace datahub {
     public:
         Array() : _base(ElementType::ARRAY, 0, sizeof(Array<T>), Array<T>::_onItemChanged), _validateFunction(Array<T>::_validate) {}
         
-        template<typename L, void(L:: *)(T &) const = &L::operator()> std::uint32_t add(L &&initializer) {
-            std::uint32_t resultId = 0;
+        template<typename L, void(L:: *)(T &) const = &L::operator()> ElementId add(L &&initializer) {
+            ElementId resultId = 0;
             
             if (_base.scope) {
                 Scope *scope = _base.scope;
@@ -346,7 +367,7 @@ namespace datahub {
             return resultId;
         }
 
-        void remove(std::uint32_t id) {
+        void remove(ElementId id) {
             if (_base.scope) {
                 Scope *scope = _base.scope;
 
@@ -362,7 +383,7 @@ namespace datahub {
             }
         }
         
-        T *operator[](std::uint32_t id) {
+        T *operator[](ElementId id) {
             if (_base.scope) {
                 std::lock_guard<std::mutex> guard(_base.scope->getMutex());
                 
@@ -380,17 +401,17 @@ namespace datahub {
 
     private:
         const ValidateArrayFunc _validateFunction;
-        std::unordered_map<std::uint32_t, T> _data;
+        std::unordered_map<ElementId, T> _data;
 
     public:
-        Event<void(std::uint32_t, T &)> onElementAdded;
-        Event<void(std::uint32_t)> onElementRemoving;
+        Event<void(ElementId, T &)> onElementAdded;
+        Event<void(ElementId)> onElementRemoving;
     };
     
     // []
     template<typename... Args> class RCall : private Base {
     private:
-        static void _onItemChanged(Base *target, std::uint32_t id, BufferRef *serializedData) {
+        static void _onItemChanged(Base *target, ElementId id, BufferRef *serializedData) {
             RCall<Args...> *self = static_cast<RCall<Args...> *>(target);
     
         }
@@ -430,7 +451,7 @@ namespace datahub {
         
         std::shared_ptr<T> result = std::make_shared<T>();
         
-        if (DataHub::_initializeDataHub(result.get(), DataHubType::LOCAL, sizeof(T) - sizeof(DataHub))) {
+        if (DataHub::_initializeLocal(result.get(), sizeof(T) - sizeof(DataHub))) {
             return result;
         }
         else {
@@ -440,42 +461,24 @@ namespace datahub {
         return std::shared_ptr<T>(nullptr);
     }
     
-    // Make server datahub
+    // Make client datahub
     //
-    template<typename T> inline auto makeAndListen(const char *ip, std::uint16_t portTCP) {
+    template<typename T> inline auto makeAndConnect(const char *ip, std::uint16_t portTCP, std::uint16_t portUDP, const std::uint8_t *key, std::function<void()> &&disconnected) {
         static_assert(std::is_base_of<DataHub, T>::value, "");
         static_assert(std::is_default_constructible<T>::value, "");
         static_assert(std::is_polymorphic<T>::value == false, "");
-        
+
         std::shared_ptr<T> result = std::make_shared<T>();
-        
-        if (DataHub::_initializeDataHub(result.get(), DataHubType::SERVER, sizeof(T) - sizeof(DataHub), ip, portTCP)) {
+
+        if (DataHub::_initializeClient(result.get(), DataHubType::CLIENT, sizeof(T) - sizeof(DataHub), ip, portTCP, portUDP, key, disconnected)) {
             return result;
         }
         else {
-            DataHub::onError("At 'DataHub::makeAndListen(...)' : cannot initialize datahub server");
+            DataHub::onError("At 'DataHub::makeAndListen(...)' : cannot initialize datahub client");
         }
-        
+
         return std::shared_ptr<T>(nullptr);
     };
 
-    // Make client datahub
-    //
-    template<typename T> inline auto makeAndConnect(const char *server, std::uint16_t portTCP) {
-        static_assert(std::is_base_of<DataHub, T>::value, "");
-        static_assert(std::is_default_constructible<T>::value, "");
-        static_assert(std::is_polymorphic<T>::value == false, "");
-        
-        std::shared_ptr<T> result = std::make_shared<T>();
-        
-        if (DataHub::_initializeDataHub(result.get(), DataHubType::CLIENT, sizeof(T) - sizeof(DataHub), server, portTCP)) {
-            return result;
-        }
-        else {
-            DataHub::onError("At 'DataHub::makeAndConnect(...)' : cannot initialize datahub client");
-        }
-        
-        return std::shared_ptr<T>(nullptr);
-    };
 
 }
