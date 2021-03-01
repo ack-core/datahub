@@ -6,6 +6,7 @@
 #include <thread>
 #include <atomic>
 #include <vector>
+#include <unordered_set>
 
 #include <sys/types.h>
 #include <sys/event.h>
@@ -490,6 +491,16 @@ namespace datahub {
 }
 
 namespace datahub {
+    const std::uint16_t MSG_HEADER_LENGTH = 1;
+    
+    enum class MsgHeader : std::uint8_t {
+        VALUE_CHANGED = 0x10,
+        ARRAY_ELEMENT_ADDED = 0x11,
+        ARRAY_ELEMENT_REMOVED = 0x11,
+    };
+}
+
+namespace datahub {
     namespace {
         // TODO: validate for serialized size < std::uint16_t::max()
         bool validateLayout(const std::uint8_t *layoutData, std::size_t layoutLength) {
@@ -528,6 +539,7 @@ namespace datahub {
     struct Scope::Data {
         std::mutex mutex;
         AccessType accessType;
+        std::unordered_set<ClientId> observers;
     };
     
     struct DataHub::Data {
@@ -552,6 +564,12 @@ namespace datahub {
 
     private:
         std::unordered_map<ElementId, Base *> _elements;
+    };
+    
+    struct DataHub::Network {
+        ~Network() {
+            printf("!!!\n"); // TODO: correct deconstruction
+        }
     };
     
     struct ServerData : public DataHub::Network {
@@ -579,7 +597,7 @@ namespace datahub {
         network::ConnectionState *onConnected(const std::uint8_t *key) {
             ClientId id = _nextClientUID++;
             ConnectionState *connection = &_connections[id];
-            connection->nextBytesToReceive = 1;
+            connection->nextBytesToReceive = MSG_HEADER_LENGTH;
             connection->id = id;
             return connection;
         }
@@ -640,9 +658,17 @@ namespace datahub {
         return _data->mutex;
     }
 
-    void Scope::_onValueChanged(std::uint32_t id, const std::uint8_t (&serializedData)[BUFFER_SIZE], std::uint16_t length) { // length is used to send over network
+    void Scope::_onValueChanged(std::uint32_t id, const std::uint8_t (&serializedData)[BUFFER_SIZE], std::uint16_t length) {
         if (auto element = datahub->_data->findElement(id)) {
             auto bufferRef = std::cref(serializedData);
+            
+            if (datahub->_data->type == DataHubType::CLIENT) {
+
+            }
+            else if (datahub->_data->type == DataHubType::SERVER) {
+                //ServerData *serverData = static_cast<ServerData *>(datahub->_network.get());
+            }
+            
             element->onItemChanged(element, id, &bufferRef);
         }
         else {
@@ -677,7 +703,7 @@ namespace datahub {
         
     }
     
-    void DataHub::startServer(const char *ip, std::uint16_t portTCP, std::uint16_t portUDP, std::function<bool(ClientId, const std::uint8_t *)> &&cn, std::function<void(ClientId)> &&dn) {
+    bool DataHub::startServer(const char *ip, std::uint16_t portTCP, std::uint16_t portUDP, std::function<bool(ClientId, const std::uint8_t *)> &&cn, std::function<void(ClientId)> &&dn) {
         if (_data->type == DataHubType::LOCAL) {
             _data->type = DataHubType::SERVER;
             _network = std::make_unique<ServerData>();
@@ -685,13 +711,18 @@ namespace datahub {
             ServerData *serverData = static_cast<ServerData *>(_network.get());
             serverData->server.initializeObserver<ServerData, &ServerData::onConnected, &ServerData::onDisconnected, &ServerData::onDataReceived, &ServerData::onError>(serverData);
             
-            if (serverData->server.listen(ip, portTCP, portUDP) == false) {
+            if (serverData->server.listen(ip, portTCP, portUDP)) {
+                return true;
+            }
+            else {
                 DataHub::onError("At 'DataHub::startServer(...)' : server can't start listening");
             }
         }
         else {
             DataHub::onError("At 'DataHub::startServer(...)' : datahub of type = LOCAL is required to start server");
         }
+        
+        return false;
     }
     
     void DataHub::disconnect(std::uint32_t clientId) {
@@ -715,16 +746,8 @@ namespace datahub {
         return workingBuffer;
     }
 
-    bool DataHub::_getNextID(std::uint32_t &outID) {
-        if (_data->type != DataHubType::CLIENT) {
-            outID = _data->nextElementUID++;
-            return true;
-        }
-        else {
-            DataHub::onError("At 'DataHub::_getWorkingBuffer()' : attempt to generate unique id from client");
-        }
-
-        return false;
+    ElementId DataHub::_getNextID() {
+        return _data->nextElementUID++;
     }
 
     bool DataHub::_initializeLocal(DataHub *dh, std::size_t lsize) {
@@ -763,11 +786,12 @@ namespace datahub {
                 ClientData *clientData = static_cast<ClientData *>(dh->_network.get());
                 clientData->client.initializeObserver<ClientData, &ClientData::onDisconnected, &ClientData::onDataReceived, &ClientData::onError>(clientData);
                 
-                if (clientData->client.connect(ip, portTCP, portUDP, key, 1) == false) {
-                    DataHub::onError("At 'DataHub::startServer(...)' : server can't start listening");
+                if (clientData->client.connect(ip, portTCP, portUDP, key, MSG_HEADER_LENGTH)) {
+                    return true;
                 }
-                
-                return true;
+                else {
+                    DataHub::onError("At 'DataHub::_initializeClient(...)' : can't connect");
+                }
             }
             else {
                 DataHub::onError("At 'DataHub::_initializeDataHub(...)' : layout initialization failed");
@@ -788,25 +812,20 @@ namespace datahub {
         while (layoutOffset < layoutData + layoutLength) {
             datahub::Base *item = reinterpret_cast<datahub::Base *>(layoutOffset);
 
-            if (scope->datahub->_getNextID(item->uid)) {
-                item->scope = scope;
+            item->uid = scope->datahub->_getNextID();
+            item->scope = scope;
 
-                if (serializedOffset) {
-                    std::memcpy(layoutOffset + sizeof(datahub::Base), serializedOffset, item->dataLength);
-                    serializedOffset += item->dataLength;
-                }
-
-                if (scope->datahub->_data->addElement(item->uid, item) == false) {
-                    DataHub::onError("At 'DataHub::_initializeLayout(...)' : id of new element is already in use");
-                    return false;
-                }
-
-                layoutOffset += item->totalLength;
+            if (serializedOffset) {
+                std::memcpy(layoutOffset + sizeof(datahub::Base), serializedOffset, item->dataLength);
+                serializedOffset += item->dataLength;
             }
-            else {
-                DataHub::onError("At 'DataHub::_initializeLayout(...)' : cannot generate id");
+
+            if (scope->datahub->_data->addElement(item->uid, item) == false) {
+                DataHub::onError("At 'DataHub::_initializeLayout(...)' : id of new element is already in use");
                 return false;
             }
+
+            layoutOffset += item->totalLength;
         }
         
         return true;

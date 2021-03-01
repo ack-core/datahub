@@ -135,6 +135,9 @@ namespace datahub {
         AccessType getAccessType() const;
         std::mutex &getMutex();
         
+        void addObserver(ClientId clientId);
+        void removeObserver(ClientId clientId);
+        
     protected:
         Scope();
         ~Scope();
@@ -175,8 +178,10 @@ namespace datahub {
         // user must provide implementation
         static void onError(const char *msg, ...);
         
-        void startServer(const char *ip, std::uint16_t portTCP, std::uint16_t portUDP, std::function<bool(ClientId, const std::uint8_t *)> &&cn, std::function<void(ClientId)> &&dn);
+        bool startServer(const char *ip, std::uint16_t portTCP, std::uint16_t portUDP, std::function<bool(ClientId, const std::uint8_t *)> &&cn, std::function<void(ClientId)> &&dn);
         void disconnect(ClientId clientId);
+
+        Scope &getRootScope();
         
     protected:
         DataHub();
@@ -189,11 +194,11 @@ namespace datahub {
         static std::uint16_t _serializeLayout(const std::uint8_t *layout, std::size_t length, std::uint8_t (&output)[BUFFER_SIZE]);
         static std::uint8_t (&_getWorkingBuffer())[BUFFER_SIZE];
         
-        bool _getNextID(ElementId &outID);
+        ElementId _getNextID();
         
     public:
         struct Data;
-        struct Network {};
+        struct Network;
 
     private:
         std::unique_ptr<Data> _data;
@@ -343,18 +348,15 @@ namespace datahub {
                 Scope *scope = _base.scope;
             
                 if (scope->getAccessType() == AccessType::READWRITE) {
-                    if (scope->datahub->_getNextID(resultId)) {
-                        T item {};
-                        initializer(item);
-                        
-                        std::uint8_t (&buffer)[BUFFER_SIZE] = DataHub::_getWorkingBuffer();
-                        std::uint16_t lengthInBytes = DataHub::_serializeLayout(reinterpret_cast<std::uint8_t *>(&item) + sizeof(Scope), sizeof(T) - sizeof(Scope), buffer);
+                    resultId = scope->datahub->_getNextID();
+
+                    T item {};
+                    initializer(item);
                     
-                        _base.scope->_onItemAdded(_base.uid, resultId, buffer, lengthInBytes);
-                    }
-                    else {
-                        DataHub::onError("At 'Array::add(...)' : cannot generate id");
-                    }
+                    std::uint8_t (&buffer)[BUFFER_SIZE] = DataHub::_getWorkingBuffer();
+                    std::uint16_t lengthInBytes = DataHub::_serializeLayout(reinterpret_cast<std::uint8_t *>(&item) + sizeof(Scope), sizeof(T) - sizeof(Scope), buffer);
+                
+                    _base.scope->_onItemAdded(_base.uid, resultId, buffer, lengthInBytes);
                 }
                 else {
                     DataHub::onError("At 'Array::add(...)' : array is readonly");
@@ -470,7 +472,7 @@ namespace datahub {
 
         std::shared_ptr<T> result = std::make_shared<T>();
 
-        if (DataHub::_initializeClient(result.get(), DataHubType::CLIENT, sizeof(T) - sizeof(DataHub), ip, portTCP, portUDP, key, disconnected)) {
+        if (DataHub::_initializeClient(result.get(), sizeof(T) - sizeof(DataHub), ip, portTCP, portUDP, key, std::move(disconnected))) {
             return result;
         }
         else {
