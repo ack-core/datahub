@@ -198,12 +198,9 @@ namespace datahub {
         
     public:
         struct Data;
-        struct Network;
 
     private:
         std::unique_ptr<Data> _data;
-        std::unique_ptr<Network> _network;
-
         Scope _root;
     };
     
